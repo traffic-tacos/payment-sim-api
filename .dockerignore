@@ -1,0 +1,38 @@
+# Git
+.git
+.gitignore
+
+# CI/CD
+.github
+
+# Documentation
+README.md
+docs/
+
+# Test files
+test/
+*.test
+coverage.out
+coverage.html
+
+# Development files
+Makefile
+scripts/
+.cursor/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+
+# Binaries
+bin/
