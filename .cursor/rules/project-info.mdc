@@ -1,0 +1,158 @@
+---
+description:
+globs:
+alwaysApply: true
+---
+📌 payment-sim-api 애플리케이션 전용 프롬프트 (Go 버전 · AI 전달용)
+
+당신은 Go로 결제 모의 서비스(payment-sim-api)를 구현하는 시니어 서버 엔지니어입니다.
+인프라/배포(K8s/Helm/IaC)는 이미 준비되어 있으니, 애플리케이션 코드/계약/관측/테스트에만 집중하세요.
+
+## 0) 컨텍스트
+- 목적: 예약 시스템의 결제 단계 시뮬레이션(승인/실패/지연/랜덤), 지정된 webhook URL로 콜백 POST.
+- 상위 호출자: api-gateway(REST). 콜백 수신 측: reservation-api 또는 worker의 공개 엔드포인트.
+- 요구: 고RPS에서 가볍고 예측 가능한 지연 처리, 멱등성, 서명 검증.
+
+## 1) 기술 스택(애플리케이션만)
+- Go 1.22+, linux/arm64
+- HTTP 서버: 표준 라이브러리 net/http + chi(또는 fiber/echo 중 하나 선택)
+- HTTP 클라이언트: net/http(Client) + 커스텀 Transport(keep-alive, 연결 풀 튜닝)
+- 직렬화: encoding/json (필요 시 jsoniter 옵션 가능)
+- 검증: go-playground/validator 또는 자체 검증
+- 로깅: zap(JSON 구조 로그)
+- 관측: OpenTelemetry(OTLP) + otelhttp 미들웨어, Prometheus(client_golang)
+- 동시성 유틸: time.Timer/AfterFunc + worker pool(콜백 발송 상한 제어)
+- 멱등 캐시: 내장 LRU(ristretto 등) 또는 in-memory map+TTL(프로세스 재시작 시 휘발 허용)
+
+## 2) 도메인/동작
+- 결제 의도 생성 → 내부 스케줄러가 지연 후 webhook 전송 → 수신 측 2xx 응답 시 성공 처리.
+- 시나리오: approve | fail | delay | random(기본 승인 80%/실패 20%, 가변)
+- 멱등성: 동일 `Idempotency-Key` + Body hash면 동일 `payment_intent_id`로 스냅샷 응답.
+
+## 3) REST API 계약(OpenAPI 3.1 산출)
+### 3.1 POST /v1/sim/intent
+Headers:
+- (선택) Idempotency-Key: <uuid-v4>
+Body:
+{
+  "reservation_id": "rsv_123",
+  "amount": 120000,
+  "scenario": "approve|fail|delay|random",
+  "delay_ms": 0,
+  "webhook_url": "https://reservation-api.example.com/internal/payment/webhook",
+  "metadata": { "any": "thing" }
+}
+Logic:
+1) 입력 검증(필수 필드, 금액>0, URL 유효성).
+2) `payment_intent_id = "pay_"+ULID()`. 멱등 키가 있고 동일 바디면 동일 결과 반환.
+3) 지연 설정: scenario별 기본 지연(approve 100~300ms, fail 50~150ms, delay=입력 or 3s, random은 내부 확률).
+4) 내부 스케줄링(타이머/워크풀)에 등록 → 만료 후 webhook POST 예약.
+Response 200:
+{ "payment_intent_id":"pay_abc", "status":"PENDING", "next":"webhook" }
+
+오류:
+400 VALIDATION_FAILED, 409 IDEMPOTENCY_CONFLICT
+
+### 3.2 POST /v1/sim/webhook/test   (운영자/테스트용 수동 발송)
+Body:
+{ "payment_intent_id":"pay_abc", "type":"payment.approved|payment.failed", "webhook_url":"https://..." }
+Response: 202 { "sent": true }
+
+### 3.3 GET /v1/sim/intents/{payment_intent_id}
+Response:
+{ "payment_intent_id":"pay_abc", "reservation_id":"rsv_123", "status":"PENDING|APPROVED|FAILED", "last_attempt_at":"ISO8601" }
+
+### 3.4 헬스/메트릭
+GET /healthz, GET /readyz, GET /metrics (Prometheus)
+
+### 에러 포맷(공통)
+{ "error": { "code":"STRING_CODE", "message":"...", "trace_id":"..." } }
+
+## 4) Webhook 사양(송신자=payment-sim-api)
+- Method: POST
+- Headers:
+  - X-Webhook-Id: <uuid>
+  - X-Timestamp: <epoch_ms>
+  - X-Signature: sha256=<HMAC_HEX>   // body + timestamp로 HMAC, 비밀키는 환경변수
+  - Content-Type: application/json
+- Body:
+{
+  "type": "payment.approved|payment.failed",
+  "reservation_id": "rsv_123",
+  "payment_intent_id": "pay_abc",
+  "amount": 120000,
+  "ts": "ISO8601",
+  "metadata": { "any": "thing" }
+}
+- 재시도: 수신자 응답이 2xx 아니면 지수 백오프(1s, 2s, 4s, 8s, …) 최대 N회.
+- 멱등성: 동일 X-Webhook-Id 재전송 시 페이로드 동일, 서명 동일.
+- 타임아웃: 단건 콜백 요청 타임아웃 기본 1s (환경으로 오버라이드).
+
+## 5) 보안/조작 방지
+- HMAC 비밀: WEBHOOK_SECRET (env) — X-Signature 생성.
+- 재생 방지: X-Timestamp 기준 ±5분 유효(서명 입력에 timestamp 포함).
+- 발송 상한: 내부 worker pool + 토큰버킷으로 `WEBHOOK_MAX_RPS` 제한 가능.
+- 로깅 마스킹: 서명/비밀 일부 마스킹.
+
+## 6) 성능/동시성/튜닝 목표(앱 레벨)
+- 자체 엔드포인트 처리 P95 < 20ms (webhook 전송 제외).
+- HTTP 클라이언트 Transport:
+  - MaxIdleConns=2000, MaxIdleConnsPerHost=1000, IdleConnTimeout=90s, DisableCompression=false
+- 웹훅 발송 워커:
+  - 큐(버퍼드 채널) + 워커 N(코어×2~4) + rate limiter(옵션)
+  - 실패 시 재시도 큐로 이동(Dead-letter in-memory, 최대 N회)
+- 메모리: intent 상태는 인메모리 맵+TTL 또는 경량 임시스토리지(파일/boltdb 옵션화). (지속성 요구 없음)
+
+## 7) 관측/메트릭/로그
+- OpenTelemetry: otelhttp 미들웨어로 traceparent 수용/전파, 외부 webhook POST에도 span 생성.
+- Prometheus 지표:
+  - http_requests_total{route,code}, http_request_duration_seconds_bucket
+  - webhook_delivery_total{result="success|failure|timeout"}, webhook_latency_seconds_bucket
+  - idempotency_hits_total, scenario_counter_total{scenario}
+- zap JSON 로그 필드:
+  - ts, level, msg, route, status, latency_ms, payment_intent_id, target_host, attempt, result, trace_id
+
+## 8) 설정(환경변수 키만; 값 주입은 외부)
+- PORT=8080
+- WEBHOOK_SECRET=<hmac key> (필수)
+- DEFAULT_APPROVE_DELAY_MS=200
+- DEFAULT_FAIL_DELAY_MS=100
+- DEFAULT_DELAY_DELAY_MS=3000
+- RANDOM_APPROVE_RATE=0.8
+- WEBHOOK_TIMEOUT_MS=1000
+- WEBHOOK_MAX_RETRIES=5
+- WEBHOOK_BACKOFF_MS=1000    // 최초 간격(지수)
+- WEBHOOK_MAX_RPS=500        // 0이면 무제한
+- OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+- LOG_LEVEL=info
+
+## 9) 테스트/품질(코드 중심)
+- 단위: 입력 검증, HMAC 서명, 멱등 캐시, 시나리오 분기, 백오프/재시도 로직, rate limiter.
+- 통합: 임시 수신 서버(httptest.Server)로 webhook 성공/실패/지연/타임아웃 시나리오 검증.
+- 부하: k6/http 또는 vegeta 스크립트 동봉(의도 생성 2k rps, 콜백 1k rps 상한) — 실행은 외부에서.
+- 계약: OpenAPI 문서(openapi/payment-sim.yaml) 생성 및 스키마 검증 테스트.
+
+## 10) 리포지토리 구조(애플리케이션만)
+- /cmd/payment-sim-api/main.go
+- /internal/http/           // 라우터, 핸들러, 미들웨어(otelhttp, request-id)
+- /internal/service/        // intent 생성, 스케줄링, 상태관리
+- /internal/webhook/        // HMAC 서명, 발송 워커, 재시도/백오프, rate limit
+- /internal/observability/  // otel, prometheus, logger
+- /internal/config/         // env 파싱, 기본값
+- /internal/store/          // 멱등/의도 상태(in-memory TTL, 선택적 인터페이스)
+- /openapi/payment-sim.yaml
+- /scripts/run_local.sh
+- Makefile (lint/test/build), Dockerfile, README.md
+- /test/ (unit + integration)
+
+## 11) 에러 코드(고정 문자열)
+- 400 VALIDATION_FAILED
+- 401 UNAUTHENTICATED  (필요 시)
+- 409 IDEMPOTENCY_CONFLICT
+- 429 RATE_LIMITED
+- 500 WEBHOOK_DISPATCH_ERROR
+- 504 WEBHOOK_TIMEOUT
+
+### 최종 지시
+위 명세에 따라 payment-sim-api의 **애플리케이션 코드/계약/관측/테스트**를 생성하세요.
+인프라/배포 스펙(K8s/Helm/IaC)은 포함하지 말고, 환경변수 키만 노출하며 값 주입은 외부에서 처리되도록 하세요.
