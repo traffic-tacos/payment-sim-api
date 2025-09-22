@@ -3,55 +3,73 @@ description:
 globs:
 alwaysApply: true
 ---
-📌 payment-sim-api 애플리케이션 전용 프롬프트 (Go 버전 · AI 전달용)
+📌 payment-sim-api 애플리케이션 정보 (순수 gRPC 버전)
 
-당신은 Go로 결제 모의 서비스(payment-sim-api)를 구현하는 시니어 서버 엔지니어입니다.
-인프라/배포(K8s/Helm/IaC)는 이미 준비되어 있으니, 애플리케이션 코드/계약/관측/테스트에만 집중하세요.
+Traffic Tacos MSA Platform의 **순수 gRPC 결제 시뮬레이션 서비스**입니다.
+inventory-api 패턴을 따라 순수 gRPC로 구현되었으며, 중앙화된 proto-contracts 모듈을 사용합니다.
 
-## 0) 컨텍스트
-- 목적: 예약 시스템의 결제 단계 시뮬레이션(승인/실패/지연/랜덤), 지정된 webhook URL로 콜백 POST.
-- 상위 호출자: api-gateway(REST). 콜백 수신 측: reservation-api 또는 worker의 공개 엔드포인트.
-- 요구: 고RPS에서 가볍고 예측 가능한 지연 처리, 멱등성, 서명 검증.
+## 현재 구현 상태
+- 목적: 예약 시스템의 결제 단계 시뮬레이션(승인/실패/지연/랜덤), EventBridge + Webhook 이중 처리
+- 상위 호출자: gateway-api(gRPC), reservation-api(gRPC). 콜백 수신 측: reservation-api webhook + EventBridge
+- 요구: 30k RPS 처리 목표, inventory-api와 동일한 순수 gRPC 아키텍처
 
-## 1) 기술 스택(애플리케이션만)
-- Go 1.22+, linux/arm64
-- HTTP 서버: 표준 라이브러리 net/http + chi(또는 fiber/echo 중 하나 선택)
-- HTTP 클라이언트: net/http(Client) + 커스텀 Transport(keep-alive, 연결 풀 튜닝)
-- 직렬화: encoding/json (필요 시 jsoniter 옵션 가능)
-- 검증: go-playground/validator 또는 자체 검증
+## 1) 기술 스택(현재 구현)
+- Go 1.24+, multi-arch (darwin/linux arm64/amd64)
+- gRPC 서버: google.golang.org/grpc + reflection (포트 8030)
+- HTTP 서버: net/http (헬스체크 + 메트릭스만, 포트 8031)
+- Proto 계약: github.com/traffic-tacos/proto-contracts (중앙화된 모듈)
+- AWS 통합: EventBridge + SQS (AWS SDK v2, 프로필: tacos)
+- HTTP 클라이언트: net/http(Client) (webhook 발송용)
 - 로깅: zap(JSON 구조 로그)
-- 관측: OpenTelemetry(OTLP) + otelhttp 미들웨어, Prometheus(client_golang)
-- 동시성 유틸: time.Timer/AfterFunc + worker pool(콜백 발송 상한 제어)
-- 멱등 캐시: 내장 LRU(ristretto 등) 또는 in-memory map+TTL(프로세스 재시작 시 휘발 허용)
+- 관측: Prometheus(client_golang) + health endpoints
+- 동시성: goroutine + time.Timer (webhook 지연 처리)
+- 상태 저장: in-memory map (프로세스 재시작 시 휘발)
 
-## 2) 도메인/동작
-- 결제 의도 생성 → 내부 스케줄러가 지연 후 webhook 전송 → 수신 측 2xx 응답 시 성공 처리.
-- 시나리오: approve | fail | delay | random(기본 승인 80%/실패 20%, 가변)
-- 멱등성: 동일 `Idempotency-Key` + Body hash면 동일 `payment_intent_id`로 스냅샷 응답.
+## 2) gRPC 서비스 구현
+- 결제 의도 생성 → EventBridge 이벤트 발행 + HTTP webhook 이중 처리
+- 시나리오: PAYMENT_SCENARIO_APPROVE|FAIL|DELAY|RANDOM (proto enum)
+- 상태: PAYMENT_STATUS_PENDING → COMPLETED|FAILED (proto enum)
 
-## 3) REST API 계약(OpenAPI 3.1 산출)
-### 3.1 POST /v1/sim/intent
-Headers:
-- (선택) Idempotency-Key: <uuid-v4>
-Body:
+## 3) gRPC API 계약 (proto-contracts 모듈 기반)
+
+### 사용 가능한 gRPC 메서드:
+- `CreatePaymentIntent` - 결제 인텐트 생성
+- `GetPaymentStatus` - 결제 상태 조회
+- `ProcessPayment` - 결제 처리
+- `CancelPayment` - 결제 취소
+- `ListPayments` - 결제 목록 조회
+- `SimulateWebhook` - 웹훅 시뮬레이션
+
+### 3.1 CreatePaymentIntent
+Request:
 {
   "reservation_id": "rsv_123",
-  "amount": 120000,
-  "scenario": "approve|fail|delay|random",
-  "delay_ms": 0,
-  "webhook_url": "https://reservation-api.example.com/internal/payment/webhook",
-  "metadata": { "any": "thing" }
+  "user_id": "user_456",
+  "amount": {"amount": 120000, "currency": "KRW"},
+  "scenario": "PAYMENT_SCENARIO_APPROVE",
+  "webhook_url": "https://reservation-api.example.com/internal/payment/webhook"
 }
-Logic:
-1) 입력 검증(필수 필드, 금액>0, URL 유효성).
-2) `payment_intent_id = "pay_"+ULID()`. 멱등 키가 있고 동일 바디면 동일 결과 반환.
-3) 지연 설정: scenario별 기본 지연(approve 100~300ms, fail 50~150ms, delay=입력 or 3s, random은 내부 확률).
-4) 내부 스케줄링(타이머/워크풀)에 등록 → 만료 후 webhook POST 예약.
-Response 200:
-{ "payment_intent_id":"pay_abc", "status":"PENDING", "next":"webhook" }
+Response:
+{
+  "payment_intent_id": "uuid",
+  "status": "PAYMENT_STATUS_PENDING"
+}
 
-오류:
-400 VALIDATION_FAILED, 409 IDEMPOTENCY_CONFLICT
+### 3.2 GetPaymentStatus
+Request:
+{
+  "payment_intent_id": "uuid",
+  "user_id": "user_456"
+}
+Response:
+{
+  "payment": {
+    "payment_intent_id": "uuid",
+    "reservation_id": "rsv_123",
+    "status": "PAYMENT_STATUS_PENDING|COMPLETED|FAILED",
+    "amount": {"amount": "120000", "currency": "KRW"}
+  }
+}
 
 ### 3.2 POST /v1/sim/webhook/test   (운영자/테스트용 수동 발송)
 Body:
@@ -112,19 +130,17 @@ GET /healthz, GET /readyz, GET /metrics (Prometheus)
 - zap JSON 로그 필드:
   - ts, level, msg, route, status, latency_ms, payment_intent_id, target_host, attempt, result, trace_id
 
-## 8) 설정(환경변수 키만; 값 주입은 외부)
-- PORT=8080
-- WEBHOOK_SECRET=<hmac key> (필수)
-- DEFAULT_APPROVE_DELAY_MS=200
-- DEFAULT_FAIL_DELAY_MS=100
-- DEFAULT_DELAY_DELAY_MS=3000
-- RANDOM_APPROVE_RATE=0.8
-- WEBHOOK_TIMEOUT_MS=1000
-- WEBHOOK_MAX_RETRIES=5
-- WEBHOOK_BACKOFF_MS=1000    // 최초 간격(지수)
-- WEBHOOK_MAX_RPS=500        // 0이면 무제한
-- OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
-- LOG_LEVEL=info
+## 8) 설정(환경변수 - 현재 구현)
+- GRPC_PORT=8030 (gRPC 서버 포트)
+- AWS_PROFILE=tacos (AWS 프로필, 필수)
+- AWS_REGION=ap-northeast-2 (AWS 리전)
+- EVENT_BUS_NAME=ticket-reservation-events (EventBridge 버스)
+- PAYMENT_EVENT_SOURCE=payment-sim-api (이벤트 소스)
+- PAYMENT_WEBHOOK_QUEUE_URL=<SQS URL> (필수)
+- WEBHOOK_SECRET=payment-sim-dev-secret (HMAC 키)
+- DEFAULT_DELAY_MS=2000 (지연 시간)
+- DEFAULT_SCENARIO=approve (기본 시나리오)
+- ENVIRONMENT=development|production
 
 ## 9) 테스트/품질(코드 중심)
 - 단위: 입력 검증, HMAC 서명, 멱등 캐시, 시나리오 분기, 백오프/재시도 로직, rate limiter.
@@ -153,6 +169,28 @@ GET /healthz, GET /readyz, GET /metrics (Prometheus)
 - 500 WEBHOOK_DISPATCH_ERROR
 - 504 WEBHOOK_TIMEOUT
 
+## 현재 구현 상태 (2024년 12월)
+✅ **순수 gRPC 서비스**: inventory-api 패턴 완전 적용
+✅ **Proto 계약**: github.com/traffic-tacos/proto-contracts 모듈 사용
+✅ **EventBridge 통합**: AWS EventBridge + SQS 실제 연동
+✅ **Webhook 발송**: HTTP 콜백과 EventBridge 이중 처리
+✅ **MSA 표준**: Dockerfile, Makefile, grpcui, Prometheus 완비
+✅ **포트 구성**: 8030 (gRPC), 8031 (Health + Metrics)
+
+## 개발/테스트 명령어
+```bash
+# 빌드 및 실행
+make build
+./bin/payment-sim-api
+
+# gRPC 테스트
+grpcui -plaintext localhost:8030
+grpcurl -plaintext localhost:8030 list
+
+# 헬스체크
+curl http://localhost:8031/health
+```
+
 ### 최종 지시
-위 명세에 따라 payment-sim-api의 **애플리케이션 코드/계약/관측/테스트**를 생성하세요.
-인프라/배포 스펙(K8s/Helm/IaC)은 포함하지 말고, 환경변수 키만 노출하며 값 주입은 외부에서 처리되도록 하세요.
+payment-sim-api는 현재 **순수 gRPC 아키텍처**로 완전히 전환되었습니다.
+proto-contracts 모듈을 사용하여 MSA 표준을 준수하며, EventBridge + Webhook 이중 처리를 통해 고가용성을 보장합니다.

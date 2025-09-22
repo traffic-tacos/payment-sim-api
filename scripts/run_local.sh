@@ -71,8 +71,8 @@ load_env() {
     fi
 
     # Set defaults
-    export GRPC_PORT=${GRPC_PORT:-8003}
-    export REST_PORT=${REST_PORT:-8004}
+    export GRPC_PORT=${GRPC_PORT:-8030}
+    export HEALTH_PORT=${HEALTH_PORT:-8031}
     export ENVIRONMENT=${ENVIRONMENT:-development}
     export WEBHOOK_SECRET=${WEBHOOK_SECRET:-local-dev-secret}
     export AWS_PROFILE=${AWS_PROFILE:-tacos}
@@ -96,8 +96,7 @@ build_app() {
 start_app() {
     print_status "Starting payment-sim-api..."
     print_status "gRPC server will start on port $GRPC_PORT"
-    print_status "REST server will start on port $REST_PORT"
-    print_status "Swagger UI: http://localhost:$REST_PORT/swagger"
+    print_status "Health/Metrics server will start on port $HEALTH_PORT"
 
     if command -v grpcui &> /dev/null; then
         print_status "gRPC UI available at: grpcui -plaintext localhost:$GRPC_PORT"
@@ -130,8 +129,8 @@ show_help() {
     echo "  .env.template (template file)"
     echo ""
     echo "Default ports:"
-    echo "  gRPC: 8003"
-    echo "  REST: 8004"
+    echo "  gRPC: 8030"
+    echo "  Health/Metrics: 8031"
 }
 
 # Main function

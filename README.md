@@ -16,9 +16,16 @@ Traffic Tacos MSA 플랫폼의 **순수 gRPC 결제 시뮬레이션 서비스**�
 **Layer 2: Business Services**에서 동작하는 결제 시뮬레이션 서비스:
 
 - **Framework**: Go + gRPC (순수 gRPC 서비스)
-- **포트**: 8003 (gRPC), 8082 (Health + Metrics)
+- **포트**: 8030 (gRPC), 8031 (Health + Metrics)
 - **핵심 기능**: 결제 Intent 생성/관리, 비동기 이벤트 처리, Webhook 콜백
 - **AWS 연동**: EventBridge + SQS를 통한 실제 비동기 메시징
+
+### Traffic Tacos MSA 포트 체계
+- **Gateway API**: 8000 (HTTP 엔트리포인트)
+- **Reservation API**: 8010 (Kotlin + Spring Boot)
+- **Inventory API**: 8020 (Go + gRPC)
+- **Payment Sim API**: 8030 (Go + gRPC) ← **현재 서비스**
+- **Reservation Worker**: 8040 (백그라운드 처리)
 
 ### 이벤트 기반 아키텍처
 ```
@@ -28,8 +35,8 @@ Payment-Sim-API → EventBridge → SQS → Reservation-Worker
 ```
 
 ### 포트 구성 (inventory-api 패턴)
-- **8003**: gRPC 서비스 (비즈니스 로직)
-- **8082**: HTTP 서버 (헬스체크 + 메트릭스만)
+- **8030**: gRPC 서비스 (비즈니스 로직)
+- **8031**: HTTP 서버 (헬스체크 + 메트릭스만)
 
 ## 🚀 빠른 시작
 
@@ -75,15 +82,15 @@ make build
 ### 4. 서비스 확인
 ```bash
 # gRPC 웹 인터페이스 (추천)
-grpcui -plaintext localhost:8003
+grpcui -plaintext localhost:8030
 # → 브라우저에서 자동으로 열림 (http://127.0.0.1:xxxxx/)
 
 # 명령줄 테스트
-grpcurl -plaintext localhost:8003 list
+grpcurl -plaintext localhost:8030 list
 
 # 헬스체크 및 메트릭스
-curl http://localhost:8082/health
-curl http://localhost:8082/metrics
+curl http://localhost:8031/health
+curl http://localhost:8031/metrics
 ```
 
 ## 📚 API 문서
@@ -140,14 +147,14 @@ make docker-run
 
 # 또는 직접 실행
 docker build -t payment-sim-api:latest .
-docker run -p 8003:8003 -p 8082:8082 payment-sim-api:latest
+docker run -p 8030:8030 -p 8031:8031 payment-sim-api:latest
 ```
 
 ## ⚙️ 환경 변수
 
 | 변수 | 기본값 | 설명 |
 |------|--------|------|
-| `GRPC_PORT` | 8003 | gRPC 서버 포트 |
+| `GRPC_PORT` | 8030 | gRPC 서버 포트 |
 | `AWS_PROFILE` | tacos | AWS 프로필 (필수) |
 | `AWS_REGION` | ap-northeast-2 | AWS 리전 |
 | `EVENT_BUS_NAME` | ticket-reservation-events | EventBridge 버스 이름 |
@@ -159,8 +166,8 @@ docker run -p 8003:8003 -p 8082:8082 payment-sim-api:latest
 | `DEFAULT_DELAY_MS` | 2000 | 지연 시나리오 시간 |
 
 ### 포트 정보
-- **8003**: gRPC 서비스
-- **8082**: 헬스체크 + 메트릭스 (HTTP)
+- **8030**: gRPC 서비스
+- **8031**: 헬스체크 + 메트릭스 (HTTP)
 
 ## 🔗 서비스 연동
 
@@ -177,9 +184,9 @@ docker run -p 8003:8003 -p 8082:8082 payment-sim-api:latest
 ### 서비스 간 통신 플로우
 
 ```
-Gateway API → (gRPC) → Payment Sim API
-Reservation API → (gRPC) → Payment Sim API
-Payment Sim API → (EventBridge + Webhook) → Reservation API
+Gateway API (8000) → (gRPC) → Payment Sim API (8030)
+Reservation API (8010) → (gRPC) → Payment Sim API (8030)
+Payment Sim API (8030) → (EventBridge + Webhook) → Reservation API (8010)
 ```
 
 ### 🎯 실제 테스트 방법
@@ -187,7 +194,7 @@ Payment Sim API → (EventBridge + Webhook) → Reservation API
 #### 1. grpcui 웹 인터페이스 (추천)
 ```bash
 # grpcui 실행
-grpcui -plaintext localhost:8003
+grpcui -plaintext localhost:8030
 
 # 브라우저에서 나타나는 URL로 접속
 # → payment.v1.PaymentService 선택
@@ -211,7 +218,7 @@ grpcui -plaintext localhost:8003
 #### 2. grpcurl 명령줄 테스트
 ```bash
 # 서비스 목록 확인
-grpcurl -plaintext localhost:8003 list
+grpcurl -plaintext localhost:8030 list
 
 # 결제 Intent 생성
 grpcurl -plaintext -d '{
@@ -220,7 +227,7 @@ grpcurl -plaintext -d '{
   "amount": {"amount": 100000, "currency": "KRW"},
   "scenario": "approve",
   "webhook_url": "https://httpbin.org/post"
-}' localhost:8003 payment.v1.PaymentService/CreatePaymentIntent
+}' localhost:8030 payment.v1.PaymentService/CreatePaymentIntent
 ```
 
 **예상 결과:**
@@ -284,16 +291,16 @@ go test ./...
 ### 통합 테스트
 ```bash
 # 1. 서비스 헬스체크
-curl http://localhost:8082/health
+curl http://localhost:8031/health
 
 # 2. gRPC 서비스 확인
-grpcurl -plaintext localhost:8003 list
+grpcurl -plaintext localhost:8030 list
 
 # 3. gRPC 웹 인터페이스 테스트
-grpcui -plaintext localhost:8003
+grpcui -plaintext localhost:8030
 
 # 4. 실제 결제 플로우 테스트
-grpcurl -plaintext -d '{"reservation_id":"test-123","user_id":"user-456","amount":{"amount":100000,"currency":"KRW"},"scenario":"approve","webhook_url":"https://httpbin.org/post"}' localhost:8003 payment.v1.PaymentService/CreatePaymentIntent
+grpcurl -plaintext -d '{"reservation_id":"test-123","user_id":"user-456","amount":{"amount":100000,"currency":"KRW"},"scenario":"approve","webhook_url":"https://httpbin.org/post"}' localhost:8030 payment.v1.PaymentService/CreatePaymentIntent
 ```
 
 ### 성능 테스트
@@ -305,20 +312,20 @@ go install github.com/bojand/ghz/cmd/ghz@latest
 ghz --insecure --proto proto/payment/v1/payment.proto \
   --call payment.v1.PaymentService.CreatePaymentIntent \
   -d '{"reservation_id":"perf-test","user_id":"user-test","amount":{"amount":100000,"currency":"KRW"},"scenario":"approve"}' \
-  -c 10 -n 1000 localhost:8003
+  -c 10 -n 1000 localhost:8030
 
 # 부하 테스트 (30초간)
 ghz --insecure --proto proto/payment/v1/payment.proto \
   --call payment.v1.PaymentService.CreatePaymentIntent \
   -d '{"reservation_id":"load-test","user_id":"user-load","amount":{"amount":50000,"currency":"KRW"},"scenario":"random"}' \
-  -c 50 -z 30s localhost:8003
+  -c 50 -z 30s localhost:8030
 ```
 
 ## 🔍 모니터링
 
 ### 헬스체크
-- **HTTP**: `GET :8082/health`
-- **Kubernetes**: 포트 8082로 헬스체크 설정
+- **HTTP**: `GET :8031/health`
+- **Kubernetes**: 포트 8031로 헬스체크 설정
 - **Docker**: `HEALTHCHECK` 자동 설정
 
 ### 로깅

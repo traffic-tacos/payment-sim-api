@@ -10,8 +10,8 @@
 APP_NAME = payment-sim-api
 BINARY_NAME = bin/$(APP_NAME)
 DOCKER_IMAGE = $(APP_NAME):latest
-GRPC_PORT = 8003
-REST_PORT = 8004
+GRPC_PORT = 8030
+HEALTH_PORT = 8031
 
 # Build settings
 GOOS ?= $(shell go env GOOS)
@@ -63,9 +63,8 @@ ci: lint test build docker-build ## Run full CI pipeline
 
 run-local: build ## Run the application locally
 	@echo "Starting $(APP_NAME) locally..."
-	@echo "gRPC server: http://localhost:$(GRPC_PORT)"
-	@echo "REST server: http://localhost:$(REST_PORT)"
-	@echo "Swagger UI: http://localhost:$(REST_PORT)/swagger"
+	@echo "gRPC server: localhost:$(GRPC_PORT)"
+	@echo "Health/Metrics server: http://localhost:$(HEALTH_PORT)"
 	@if [ -z "$(WEBHOOK_SECRET)" ]; then \
 		echo "Warning: WEBHOOK_SECRET not set, using default"; \
 		WEBHOOK_SECRET=local-dev-secret ./$(BINARY_NAME); \
@@ -123,7 +122,7 @@ grpcui: ## Start grpcui for gRPC testing
 # Docker helpers
 docker-run: docker-build ## Run Docker container
 	@echo "Running Docker container..."
-	docker run --rm -p $(GRPC_PORT):$(GRPC_PORT) -p $(REST_PORT):$(REST_PORT) \
+	docker run --rm -p $(GRPC_PORT):$(GRPC_PORT) -p $(HEALTH_PORT):$(HEALTH_PORT) \
 		-e ENVIRONMENT=development \
 		-e WEBHOOK_SECRET=docker-dev-secret \
 		$(DOCKER_IMAGE)
@@ -149,7 +148,7 @@ status: ## Show service status and information
 	@echo "Binary: $(BINARY_NAME)"
 	@echo "Docker Image: $(DOCKER_IMAGE)"
 	@echo "gRPC Port: $(GRPC_PORT)"
-	@echo "REST Port: $(REST_PORT)"
+	@echo "Health/Metrics Port: $(HEALTH_PORT)"
 	@echo ""
 	@if [ -f "$(BINARY_NAME)" ]; then echo "✓ Binary exists"; else echo "❌ Binary not found (run 'make build')"; fi
 	@if docker images $(DOCKER_IMAGE) --format "table {{.Repository}}:{{.Tag}}" | grep -q $(APP_NAME); then echo "✓ Docker image exists"; else echo "❌ Docker image not found (run 'make docker-build')"; fi

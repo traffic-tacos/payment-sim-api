@@ -2,7 +2,7 @@ package config
 
 type Config struct {
 	Environment string `envconfig:"ENVIRONMENT" default:"development"`
-	GRPCPort    int    `envconfig:"GRPC_PORT" default:"8003"`
+	GRPCPort    int    `envconfig:"GRPC_PORT" default:"8030"`
 
 	// AWS Configuration
 	AWSRegion      string `envconfig:"AWS_REGION" default:"ap-northeast-2"`

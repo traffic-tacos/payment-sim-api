@@ -43,7 +43,7 @@ This is the **Traffic Tacos MSA (Microservices Architecture) Platform** - a high
         Layer 2: Business Services        │
      ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
      │ Reservation API │ │  Inventory API  │ │ Payment Sim API │
-     │ (Kotlin/Spring) │ │   (Go/gRPC)     │ │   (Go/Echo)     │
+     │ (Kotlin/Spring) │ │   (Go/gRPC)     │ │   (Go/gRPC)     │
      └─────────┬───────┘ └─────────────────┘ └─────────────────┘
                │
                │ Events (EventBridge/SQS)
@@ -64,7 +64,7 @@ This is the **Traffic Tacos MSA (Microservices Architecture) Platform** - a high
 - **Layer 2 - Business Services**:
   - **reservation-api**: Core reservation management with 60s hold periods and event publishing (Kotlin + Spring Boot WebFlux)
   - **inventory-api**: High-performance inventory management with zero oversell guarantee (Go + gRPC)
-  - **payment-sim-api**: Payment processing simulator with webhook support (Go + Echo)
+  - **payment-sim-api**: Payment processing simulator with EventBridge + webhook support (Go + gRPC)
 - **Layer 3 - Background Processing**:
   - **reservation-worker**: Event-driven Kubernetes job with KEDA auto-scaling for reservation expiry and cleanup tasks
 
@@ -194,7 +194,7 @@ docker build -t gateway-api:latest .
 | 1 | Gateway | Go + Fiber | Redis | HTTP + JWT | Authentication, Routing, Rate limiting |
 | 2 | Reservation | Kotlin + Spring WebFlux | DynamoDB | REST + gRPC | Reactive, Event sourcing |
 | 2 | Inventory | Go + gRPC | DynamoDB | gRPC | High performance, Zero oversell |
-| 2 | Payment Sim | Go + Echo | In-memory | REST + Webhooks | External API simulation |
+| 2 | Payment Sim | Go + gRPC | In-memory | gRPC + EventBridge + Webhooks | External API simulation |
 | 3 | Reservation Worker | Go/Kotlin | DynamoDB | SQS + Events | K8s Job, KEDA scaling, Background processing |
 
 ### Event-Driven Architecture
@@ -254,23 +254,24 @@ docker build -t gateway-api:latest .
 
 **Current Implementation:**
 - ✅ **Reservation** ↔ **Inventory**: `inventory.proto` (CheckAvailability, CommitReservation, ReleaseHold)
+- ✅ **Payment Sim API**: Uses centralized `github.com/traffic-tacos/proto-contracts` module (payment.proto)
 
 **Required gRPC Services:**
 - ❌ **Gateway** ↔ **Reservation**: `reservation.proto` (CreateReservation, GetReservation, ConfirmReservation, CancelReservation)
-- ❌ **Gateway** ↔ **Payment Sim**: `payment.proto` (CreatePaymentIntent, GetPaymentIntent, ProcessPayment)
-- ❌ **Reservation** ↔ **Payment Sim**: `payment.proto` (CreatePaymentIntent, ConfirmPayment)
+- ✅ **Gateway** ↔ **Payment Sim**: `payment.proto` (CreatePaymentIntent, GetPaymentStatus, ProcessPayment) - Via proto-contracts
+- ✅ **Reservation** ↔ **Payment Sim**: `payment.proto` (CreatePaymentIntent, ProcessPayment) - Via proto-contracts
 
 **Proto Generation Commands:**
 - **Reservation API**: `./generate_proto.sh`
 - **Inventory API**: `make generate`
 - **Gateway API**: `make generate` (needs proto setup)
-- **Payment Sim API**: `make generate` (needs proto setup)
+- **Payment Sim API**: Uses `github.com/traffic-tacos/proto-contracts` module (no local generation needed)
 
 **Proto File Locations:**
 - `reservation-api/src/main/proto/` (Kotlin client)
 - `inventory-api/proto/` (Go server)
 - `gateway-api/proto/` (Go client - needs creation)
-- `payment-sim-api/proto/` (Go server - needs creation)
+- `payment-sim-api/` Uses `github.com/traffic-tacos/proto-contracts` module (no local proto files)
 
 ### Database Schema Patterns
 - **DynamoDB Tables**: `reservations`, `orders`, `idempotency`, `outbox` (reservation-api)
@@ -347,9 +348,10 @@ export AWS_PROFILE=your-profile
 
 **Service Ports:**
 - **Gateway API**: `http://localhost:8000` (Entry point)
-- **Reservation API**: `http://localhost:8001` (Business logic)
-- **Inventory API**: `grpc://localhost:8002` (High-performance gRPC)
-- **Payment Sim API**: `http://localhost:8003` (Payment simulation)
+- **Reservation API**: `http://localhost:8010` (Business logic)
+- **Inventory API**: `grpc://localhost:8020` (High-performance gRPC)
+- **Payment Sim API**: `grpc://localhost:8030` (Payment simulation gRPC), `http://localhost:8031` (Health + Metrics)
+- **Reservation Worker**: `http://localhost:8040` (Background processing)
 
 **Infrastructure Ports:**
 - **LocalStack**: `http://localhost:4566` (AWS services simulation)
@@ -397,13 +399,13 @@ The `test_connections.sh` script provides comprehensive connectivity testing:
 **gRPC Connection Testing:**
 ```bash
 # Test inventory gRPC (currently working)
-grpcurl -plaintext localhost:8002 list
+grpcurl -plaintext localhost:8020 list
 
 # Test reservation gRPC (needs implementation)
-grpcurl -plaintext localhost:8001 list
+grpcurl -plaintext localhost:8010 list
 
-# Test payment gRPC (needs implementation)
-grpcurl -plaintext localhost:8003 list
+# Test payment gRPC (working - pure gRPC service)
+grpcurl -plaintext localhost:8030 list
 ```
 
 ### Development Workflow
@@ -615,7 +617,7 @@ Detailed Results:
 5. **Process Status**: `./health_check.sh processes`
 
 **Common Issues & Solutions:**
-- **Port Conflicts**: Use `--no-cleanup` to debug, check `lsof -i :8000-8003` or `lsof -i :3000,4090,4566`
+- **Port Conflicts**: Use `--no-cleanup` to debug, check `lsof -i :8000-8040` or `lsof -i :3000,4090,4566`
 - **Build Failures**: Check service-specific build logs
 - **Connection Issues**: Verify service startup order and dependencies
 - **Resource Constraints**: Monitor memory/CPU usage during tests
@@ -858,17 +860,17 @@ DELETE /api/v1/reservations/{id}
 결제 처리
 
 POST /api/v1/payments/intent
-- 경로: Browser → (REST) gateway-api → (REST) payment-sim-api /v1/sim/intent
-- 상세: 결제 시나리오(approve|fail|delay|random)와 webhook_url(reservation-api 내부 웹훅)을 전달.
-payment-sim-api는 지연 후 웹훅(REST POST) → reservation-api /internal/payment/webhook 호출.
+- 경로: Browser → (REST) gateway-api:8000 → (gRPC) payment-sim-api:8030 payment.v1.PaymentService/CreatePaymentIntent
+- 상세: 결제 시나리오(PAYMENT_SCENARIO_APPROVE|FAIL|DELAY|RANDOM)와 webhook_url(reservation-api:8010 내부 웹훅)을 전달.
+payment-sim-api는 지연 후 웹훅(REST POST) + EventBridge 이벤트 발행 → reservation-api:8010 처리.
 
 POST /api/v1/payments/process
-- 경로: Browser → (REST) gateway-api → (REST) payment-sim-api /v1/sim/webhook/test (또는 process API)
-- 상세: 수동 트리거/즉시 처리용(테스트용) 요청을 payment-sim-api로 전달 → payment-sim-api가 웹훅을 reservation-api에 발송.
+- 경로: Browser → (REST) gateway-api:8000 → (gRPC) payment-sim-api:8030 payment.v1.PaymentService/ProcessPayment
+- 상세: 수동 트리거/즉시 처리용(테스트용) 요청을 payment-sim-api로 전달 → payment-sim-api가 웹훅 + EventBridge를 reservation-api:8010에 발송.
 
 GET /api/v1/payments/{id}/status
-- 경로: Browser → (REST) gateway-api → (REST) payment-sim-api /v1/sim/intents/{id}
-- 상세: payment-sim-api가 보유한 intent 상태(PENDING|APPROVED|FAILED)를 조회해 반환.
+- 경로: Browser → (REST) gateway-api:8000 → (gRPC) payment-sim-api:8030 payment.v1.PaymentService/GetPaymentStatus
+- 상세: payment-sim-api가 보유한 intent 상태(PAYMENT_STATUS_PENDING|COMPLETED|FAILED)를 조회해 반환.
 
 ⸻
 

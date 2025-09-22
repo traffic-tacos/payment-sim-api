@@ -70,7 +70,7 @@ func main() {
 	mux.HandleFunc("/health", healthHandler)
 
 	metricsServer := &http.Server{
-		Addr:    ":8082",
+		Addr:    ":8031",
 		Handler: mux,
 	}
 
@@ -99,7 +99,7 @@ func main() {
 	go func() {
 		defer wg.Done()
 
-		logger.Info("Starting metrics server", zap.Int("port", 8082))
+		logger.Info("Starting metrics server", zap.Int("port", 8031))
 		if err := metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Error("Metrics server failed", zap.Error(err))
 		}
