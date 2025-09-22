@@ -8,240 +8,134 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
-	"math"
 	"net/http"
-	"strconv"
-	"sync"
 	"time"
 
-	"github.com/traffic-tacos/payment-sim-api/internal/config"
-	"github.com/traffic-tacos/payment-sim-api/internal/observability"
-	"github.com/traffic-tacos/payment-sim-api/internal/store"
 	"go.uber.org/zap"
+
+	"github.com/traffic-tacos/payment-sim-api/internal/config"
+	"github.com/traffic-tacos/payment-sim-api/internal/events"
 )
 
-// Dispatcher handles webhook delivery with retry logic and rate limiting
+type WebhookPayload struct {
+	PaymentID     string `json:"payment_id"`
+	ReservationID string `json:"reservation_id"`
+	Status        string `json:"status"`
+	Amount        int64  `json:"amount"`
+	Currency      string `json:"currency"`
+	Timestamp     int64  `json:"timestamp"`
+	EventType     string `json:"event_type"`
+}
+
 type Dispatcher struct {
-	cfg     *config.Config
-	logger  *zap.Logger
-	metrics *observability.Metrics
-	client  *http.Client
-	queue   chan *webhookJob
-	wg      sync.WaitGroup
-	stopCh  chan struct{}
+	logger     *zap.Logger
+	config     *config.Config
+	httpClient *http.Client
+	publisher  *events.Publisher
 }
 
-// webhookJob represents a webhook delivery job
-type webhookJob struct {
-	payload         *store.WebhookPayload
-	targetURL       string
-	paymentIntentID string
-	attempt         int
-}
-
-// NewDispatcher creates a new webhook dispatcher
-func NewDispatcher(cfg *config.Config, logger *zap.Logger, metrics *observability.Metrics) *Dispatcher {
-	// Configure HTTP client with optimized settings
-	client := &http.Client{
-		Timeout: time.Duration(cfg.WebhookTimeoutMs) * time.Millisecond,
-		Transport: &http.Transport{
-			MaxIdleConns:        2000,
-			MaxIdleConnsPerHost: 1000,
-			IdleConnTimeout:     90 * time.Second,
+func NewDispatcher(logger *zap.Logger, config *config.Config, publisher *events.Publisher) *Dispatcher {
+	return &Dispatcher{
+		logger:    logger,
+		config:    config,
+		publisher: publisher,
+		httpClient: &http.Client{
+			Timeout: 30 * time.Second,
 		},
 	}
-
-	dispatcher := &Dispatcher{
-		cfg:     cfg,
-		logger:  logger,
-		metrics: metrics,
-		client:  client,
-		queue:   make(chan *webhookJob, 10000), // Buffer size for high throughput
-		stopCh:  make(chan struct{}),
-	}
-
-	// Start worker goroutines
-	numWorkers := 8 // Can be made configurable
-	for i := 0; i < numWorkers; i++ {
-		dispatcher.wg.Add(1)
-		go dispatcher.worker()
-	}
-
-	return dispatcher
 }
 
-// ScheduleWebhook schedules a webhook delivery
-func (d *Dispatcher) ScheduleWebhook(ctx context.Context, payload *store.WebhookPayload, targetURL, paymentIntentID string) {
-	select {
-	case d.queue <- &webhookJob{
-		payload:         payload,
-		targetURL:       targetURL,
-		paymentIntentID: paymentIntentID,
-		attempt:         1,
-	}:
-		d.logger.Info("Webhook scheduled",
-			zap.String("payment_intent_id", paymentIntentID),
-			zap.String("target_url", targetURL),
-			zap.String("type", payload.Type))
-	default:
-		d.logger.Error("Webhook queue full, dropping webhook",
-			zap.String("payment_intent_id", paymentIntentID))
-		d.metrics.WebhookDeliveryTotal.WithLabelValues("dropped").Inc()
-	}
-}
+func (d *Dispatcher) SendPaymentWebhookAsync(paymentID, reservationID, finalStatus, webhookURL string, amount int64, currency string, delaySeconds int) {
+	// 비동기 실행 (실제 PG사처럼 지연 후 webhook 발송)
+	go func() {
+		// 가라 지연 (실제 PG 처리 시뮬레이션)
+		time.Sleep(time.Duration(delaySeconds) * time.Second)
 
-// worker processes webhook jobs from the queue
-func (d *Dispatcher) worker() {
-	defer d.wg.Done()
-
-	for {
-		select {
-		case job := <-d.queue:
-			d.processWebhook(job)
-		case <-d.stopCh:
-			return
+		payload := WebhookPayload{
+			PaymentID:     paymentID,
+			ReservationID: reservationID,
+			Status:        finalStatus,
+			Amount:        amount,
+			Currency:      currency,
+			Timestamp:     time.Now().Unix(),
+			EventType:     "payment.status_updated",
 		}
-	}
+
+		// EventBridge로 실제 이벤트 발송 (SQS로 라우팅됨)
+		if d.publisher != nil {
+			event := events.PaymentEvent{
+				PaymentID:     paymentID,
+				ReservationID: reservationID,
+				Status:        finalStatus,
+				Amount:        amount,
+				Currency:      currency,
+			}
+
+			ctx := context.Background()
+			if err := d.publisher.PublishPaymentEvent(ctx, event); err != nil {
+				d.logger.Error("Failed to publish payment event to EventBridge",
+					zap.String("payment_id", paymentID),
+					zap.Error(err))
+			}
+		}
+
+		// HTTP Webhook도 여전히 발송 (기존 시스템 호환성)
+		err := d.sendWebhook(payload, webhookURL)
+		if err != nil {
+			d.logger.Error("Failed to send webhook",
+				zap.String("payment_id", paymentID),
+				zap.String("webhook_url", webhookURL),
+				zap.Error(err))
+		} else {
+			d.logger.Info("Webhook sent successfully",
+				zap.String("payment_id", paymentID),
+				zap.String("status", finalStatus),
+				zap.String("webhook_url", webhookURL))
+		}
+	}()
 }
 
-// processWebhook processes a single webhook job
-func (d *Dispatcher) processWebhook(job *webhookJob) {
-	start := time.Now()
-
-	// Create signed request
-	req, err := d.createSignedRequest(job)
+func (d *Dispatcher) sendWebhook(payload WebhookPayload, webhookURL string) error {
+	jsonData, err := json.Marshal(payload)
 	if err != nil {
-		d.logger.Error("Failed to create webhook request",
-			zap.Error(err),
-			zap.String("payment_intent_id", job.paymentIntentID),
-			zap.Int("attempt", job.attempt))
-		d.metrics.WebhookDeliveryTotal.WithLabelValues("error").Inc()
-		return
+		return fmt.Errorf("failed to marshal webhook payload: %w", err)
 	}
 
-	// Send request
-	resp, err := d.client.Do(req)
+	req, err := http.NewRequest("POST", webhookURL, bytes.NewBuffer(jsonData))
 	if err != nil {
-		d.handleFailure(job, "network_error", err)
-		return
+		return fmt.Errorf("failed to create webhook request: %w", err)
+	}
+
+	// HTTP 헤더 설정 (실제 PG사 방식)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "PaymentSim/1.0")
+
+	// HMAC 서명 추가 (보안)
+	if d.config.WebhookSecret != "" {
+		signature := d.generateSignature(jsonData, d.config.WebhookSecret)
+		req.Header.Set("X-Webhook-Signature", signature)
+	}
+
+	d.logger.Info("Sending webhook",
+		zap.String("payment_id", payload.PaymentID),
+		zap.String("webhook_url", webhookURL),
+		zap.String("status", payload.Status))
+
+	resp, err := d.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send webhook: %w", err)
 	}
 	defer resp.Body.Close()
 
-	// Check response
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		duration := time.Since(start).Seconds()
-		d.metrics.WebhookDeliveryTotal.WithLabelValues("success").Inc()
-		d.metrics.WebhookLatency.Observe(duration)
-
-		d.logger.Info("Webhook delivered successfully",
-			zap.String("payment_intent_id", job.paymentIntentID),
-			zap.String("target_url", job.targetURL),
-			zap.Int("status_code", resp.StatusCode),
-			zap.Duration("latency", time.Since(start)),
-			zap.Int("attempt", job.attempt))
-
-		// Read response body for debugging
-		body, _ := io.ReadAll(resp.Body)
-		d.logger.Debug("Webhook response",
-			zap.String("payment_intent_id", job.paymentIntentID),
-			zap.String("response_body", string(body)))
-	} else {
-		d.handleFailure(job, fmt.Sprintf("http_%d", resp.StatusCode), fmt.Errorf("HTTP %d", resp.StatusCode))
-	}
-}
-
-// createSignedRequest creates a signed HTTP request
-func (d *Dispatcher) createSignedRequest(job *webhookJob) (*http.Request, error) {
-	// Serialize payload
-	payloadBytes, err := json.Marshal(job.payload)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal payload: %w", err)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("webhook failed with status: %d", resp.StatusCode)
 	}
 
-	// Create timestamp
-	timestamp := time.Now().UnixMilli()
-	timestampStr := strconv.FormatInt(timestamp, 10)
-
-	// Create signature
-	signature := d.createSignature(payloadBytes, timestampStr)
-
-	// Create request
-	req, err := http.NewRequest("POST", job.targetURL, bytes.NewReader(payloadBytes))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	// Add headers
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Webhook-Id", job.payload.PaymentIntentID+"_"+strconv.Itoa(job.attempt))
-	req.Header.Set("X-Timestamp", timestampStr)
-	req.Header.Set("X-Signature", "sha256="+signature)
-
-	return req, nil
+	return nil
 }
 
-// createSignature creates HMAC signature
-func (d *Dispatcher) createSignature(payload []byte, timestamp string) string {
-	message := string(payload) + timestamp
-	h := hmac.New(sha256.New, []byte(d.cfg.WebhookSecret))
-	h.Write([]byte(message))
-	return hex.EncodeToString(h.Sum(nil))
-}
-
-// handleFailure handles webhook delivery failure
-func (d *Dispatcher) handleFailure(job *webhookJob, reason string, err error) {
-	d.logger.Warn("Webhook delivery failed",
-		zap.String("payment_intent_id", job.paymentIntentID),
-		zap.String("target_url", job.targetURL),
-		zap.String("reason", reason),
-		zap.Error(err),
-		zap.Int("attempt", job.attempt))
-
-	d.metrics.WebhookDeliveryTotal.WithLabelValues("failure").Inc()
-
-	// Check if we should retry
-	if job.attempt < d.cfg.WebhookMaxRetries {
-		// Schedule retry with exponential backoff
-		backoffDelay := d.calculateBackoff(job.attempt)
-		job.attempt++
-
-		time.AfterFunc(backoffDelay, func() {
-			select {
-			case d.queue <- job:
-				d.logger.Info("Webhook retry scheduled",
-					zap.String("payment_intent_id", job.paymentIntentID),
-					zap.Int("attempt", job.attempt),
-					zap.Duration("delay", backoffDelay))
-			default:
-				d.logger.Error("Webhook retry queue full",
-					zap.String("payment_intent_id", job.paymentIntentID))
-			}
-		})
-	} else {
-		d.logger.Error("Webhook delivery abandoned after max retries",
-			zap.String("payment_intent_id", job.paymentIntentID),
-			zap.Int("attempt", job.attempt))
-		d.metrics.WebhookDeliveryTotal.WithLabelValues("abandoned").Inc()
-	}
-}
-
-// calculateBackoff calculates exponential backoff delay
-func (d *Dispatcher) calculateBackoff(attempt int) time.Duration {
-	// Exponential backoff: base_delay * 2^(attempt-1)
-	baseDelay := time.Duration(d.cfg.WebhookBackoffMs) * time.Millisecond
-	delay := baseDelay * time.Duration(math.Pow(2, float64(attempt-1)))
-
-	// Cap at 30 seconds
-	if delay > 30*time.Second {
-		delay = 30 * time.Second
-	}
-
-	return delay
-}
-
-// Stop stops the dispatcher and waits for all workers to finish
-func (d *Dispatcher) Stop() {
-	close(d.stopCh)
-	d.wg.Wait()
+func (d *Dispatcher) generateSignature(payload []byte, secret string) string {
+	h := hmac.New(sha256.New, []byte(secret))
+	h.Write(payload)
+	return "sha256=" + hex.EncodeToString(h.Sum(nil))
 }

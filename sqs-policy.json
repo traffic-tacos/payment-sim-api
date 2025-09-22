@@ -1,0 +1,19 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowEventBridgeToSendMessage",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "events.amazonaws.com"
+      },
+      "Action": "sqs:SendMessage",
+      "Resource": "arn:aws:sqs:ap-northeast-2:137406935518:traffic-tacos-payment-webhooks",
+      "Condition": {
+        "StringEquals": {
+          "aws:SourceAccount": "137406935518"
+        }
+      }
+    }
+  ]
+}
