@@ -18,7 +18,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
 
-	paymentv1 "github.com/traffic-tacos/payment-sim-api/gen/go/proto/payment/v1"
+	paymentv1 "github.com/traffic-tacos/proto-contracts/gen/go/payment/v1"
 	awsClient "github.com/traffic-tacos/payment-sim-api/internal/aws"
 	"github.com/traffic-tacos/payment-sim-api/internal/config"
 	"github.com/traffic-tacos/payment-sim-api/internal/events"
