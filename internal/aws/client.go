@@ -2,9 +2,10 @@ package aws
 
 import (
 	"context"
+	"os"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/eventbridge"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"go.uber.org/zap"
@@ -23,14 +24,31 @@ func NewClients(ctx context.Context, cfg *appconfig.Config, logger *zap.Logger) 
 		zap.String("profile", cfg.AWSProfile),
 		zap.String("region", cfg.AWSRegion))
 
-	// Load AWS config with tacos profile
-	awsConfig, err := config.LoadDefaultConfig(ctx,
-		config.WithRegion(cfg.AWSRegion),
-		config.WithSharedConfigProfile(cfg.AWSProfile),
-	)
-	if err != nil {
-		logger.Error("Failed to load AWS config", zap.Error(err))
-		return nil, err
+	// Use static credentials from environment variables to avoid profile issues
+	accessKey := os.Getenv("AWS_ACCESS_KEY_ID")
+	secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY")
+	endpointURL := os.Getenv("AWS_ENDPOINT_URL")
+
+	if accessKey == "" {
+		accessKey = "test"
+	}
+	if secretKey == "" {
+		secretKey = "test"
+	}
+
+	logger.Info("Using static AWS credentials",
+		zap.String("access_key", accessKey),
+		zap.String("endpoint_url", endpointURL))
+
+	// Create AWS config with static credentials
+	awsConfig := aws.Config{
+		Region:      cfg.AWSRegion,
+		Credentials: credentials.NewStaticCredentialsProvider(accessKey, secretKey, ""),
+	}
+
+	// Set custom endpoint if provided (for LocalStack)
+	if endpointURL != "" {
+		awsConfig.BaseEndpoint = aws.String(endpointURL)
 	}
 
 	logger.Info("AWS config loaded successfully",
