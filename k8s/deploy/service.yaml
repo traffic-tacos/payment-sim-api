@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment-sim-api
+  labels:
+    app: payment-sim-api
+spec:
+  selector:
+    app: payment-sim-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http        # 8030
+    - name: health
+      port: 8031
+      targetPort: health      # 8031
+  type: ClusterIP

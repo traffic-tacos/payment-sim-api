@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-sim-api
+  labels:
+    app: payment-sim-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: payment-sim-api
+  template:
+    metadata:
+      labels:
+        app: payment-sim-api
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+      containers:
+        - name: payment-sim-api
+          image: ${{ vars.ECR_BASE_REPO }}/traffic-tacos-payment-sim-api:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8030
+            - name: health
+              containerPort: 8031
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: health
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          # resources:
+          #   requests: { cpu: "100m", memory: "128Mi" }
+          #   limits:   { cpu: "500m", memory: "512Mi" }
